@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ctf_pcapgen.py - A network-forensics CTF challenge authoring tool.
+chumbucket.py - A network-forensics CTF challenge authoring tool.
 
 Generates a .pcap containing a controlled volume of plausible "noise" traffic
 per protocol, then hides a flag inside it using one of several techniques at a
@@ -15,6 +15,7 @@ Requires: scapy  (pip install scapy)
 
 import argparse
 import base64
+import gzip
 import ipaddress
 import random
 import sys
@@ -255,7 +256,7 @@ def interactive_config(args):
     args.icmp  = ask_int("  ICMP pings",      8)
     args.arp   = ask_int("  ARP exchanges",   10)
     args.dhcp  = ask_int("  DHCP handshakes", 2)
-    args.clients = ask_int("  Distinct client hosts on the LAN", 6)
+    args.clients = ask_int("  How many distinct hosts/IPs to generate on the LAN", 6)
     args.decoys = ask_int("  Decoy/red-herring fake flags", 3)
     args.normalize = ask_yesno("  Normalize timing (even spacing, tidy capture)?", False)
 
@@ -401,32 +402,76 @@ def _rand_ip(net: ipaddress.IPv4Network, rng: random.Random) -> str:
 # --- realistic data tables -------------------------------------------------
 
 _USER_AGENTS = [
+    # desktop Chrome / Edge / Firefox / Safari
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.2420.65",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
     "(KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    # mobile
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 "
     "(KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPad; CPU OS 17_4 like Mac OS X) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+    # API clients / CLI / bots (great for variety in a forensic capture)
+    "curl/8.6.0",
+    "Wget/1.21.4",
+    "python-requests/2.31.0",
+    "Go-http-client/2.0",
+    "PostmanRuntime/7.37.3",
+    "Apache-HttpClient/4.5.14 (Java/17.0.10)",
+    "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+    "Mozilla/5.0 (X11; Linux x86_64) node-fetch/1.0",
+    "axios/1.6.8",
 ]
 _WEB_HOSTS = [
     ("www.example.com", "93.184.216.34"),
     ("api.weather.io", "104.18.32.7"),
     ("cdn.jsdelivr.net", "151.101.1.229"),
     ("update.microsoft.com", "23.45.112.61"),
+    ("fonts.gstatic.com", "142.250.80.3"),
     ("telemetry.corp.local", "10.0.0.20"),
     ("intranet.corp.local", "10.0.0.21"),
 ]
-_PATHS = ["/", "/index.html", "/login", "/api/v1/status", "/static/app.js",
-          "/assets/logo.png", "/dashboard", "/favicon.ico", "/health"]
+_PATHS = ["/", "/index.html", "/login", "/api/v1/status", "/dashboard",
+          "/account/profile", "/search?q=quarterly+report", "/health",
+          "/blog/2024/network-tips", "/products?page=2"]
+_ASSETS = ["/static/app.css", "/static/app.js", "/static/vendor.js",
+           "/assets/logo.png", "/assets/hero.jpg", "/favicon.ico",
+           "/fonts/inter.woff2", "/api/v1/me"]
+_REFERERS = ["https://www.google.com/", "https://duckduckgo.com/",
+             "https://www.bing.com/search?q=corp+intranet", None, None]
 _HTML_BODY = (
-    "<!DOCTYPE html><html><head><title>{title}</title>"
-    "<meta charset='utf-8'></head><body><h1>{title}</h1>"
-    "<p>Welcome. Your session id is {sid}.</p>"
-    "<ul><li>Reports</li><li>Settings</li><li>Logout</li></ul></body></html>"
+    "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>{title}</title><link rel='stylesheet' href='/static/app.css'>"
+    "<script src='/static/app.js' defer></script></head><body>"
+    "<header><nav><a href='/'>Home</a> <a href='/dashboard'>Dashboard</a> "
+    "<a href='/account/profile'>Profile</a></nav></header>"
+    "<main><h1>{title}</h1><p>Welcome back. Session {sid}.</p>"
+    "<section class='cards'><div class='card'>Reports</div>"
+    "<div class='card'>Settings</div><div class='card'>Billing</div></section>"
+    "</main><footer>&copy; 2024 {title}</footer></body></html>"
 )
-_SERVER_BANNERS = ["nginx/1.24.0", "Apache/2.4.58 (Ubuntu)",
-                   "Microsoft-IIS/10.0", "cloudflare"]
+_CSS_BODY = ("/*! app.css */\nbody{font-family:Inter,system-ui,sans-serif;margin:0;"
+             "background:#0f1419;color:#e6e6e6}nav a{margin-right:1rem;color:#4ea1d3}"
+             ".cards{display:flex;gap:1rem}.card{padding:1rem;border:1px solid #233}")
+_JS_BODY = ("/*! app.js */\n(function(){\"use strict\";var t=Date.now();"
+            "document.addEventListener(\"DOMContentLoaded\",function(){"
+            "console.log(\"loaded in\",Date.now()-t,\"ms\");"
+            "fetch(\"/api/v1/me\").then(r=>r.json()).then(d=>console.log(d));});})();")
+_SERVER_BANNERS = ["nginx/1.24.0", "nginx", "Apache/2.4.58 (Ubuntu)",
+                   "Microsoft-IIS/10.0", "cloudflare", "gunicorn/21.2.0",
+                   "Caddy", "openresty/1.25.3.1"]
+_POWERED_BY = ["PHP/8.2.17", "Express", "ASP.NET", "Next.js", None, None]
+
 
 
 def _rand_mac(rng: random.Random) -> str:
@@ -511,21 +556,133 @@ def _tls_app_data(n: int, rng: random.Random) -> bytes:
 
 # --- HTTP payload crafting -------------------------------------------------
 
-def _http_request(host: str, path: str, ua: str) -> bytes:
-    return (f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {ua}\r\n"
-            f"Accept: text/html,application/xhtml+xml,*/*;q=0.8\r\n"
-            f"Accept-Language: en-US,en;q=0.9\r\nAccept-Encoding: gzip, deflate\r\n"
-            f"Connection: keep-alive\r\n\r\n").encode()
+def _accept_for(path: str) -> str:
+    if path.endswith(".css"):
+        return "text/css,*/*;q=0.1"
+    if path.endswith(".js"):
+        return "*/*"
+    if path.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".svg")):
+        return "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+    if path.endswith(".woff2"):
+        return "*/*"
+    if path.startswith("/api") or path.endswith(".json"):
+        return "application/json, text/plain, */*"
+    return ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,*/*;q=0.8")
 
 
-def _http_response(rng: random.Random, host: str) -> bytes:
+def _http_request(rng, host, path, ua, referer=None, cookie=None,
+                  method="GET", body=b"") -> bytes:
+    is_chrome = "Chrome/" in ua and "Firefox" not in ua
+    is_mobile = any(t in ua for t in ("Mobile", "iPhone", "Android", "iPad"))
+    is_doc = not path.endswith((".css", ".js", ".png", ".jpg", ".jpeg", ".gif",
+                                ".webp", ".ico", ".svg", ".woff2")) and not path.startswith("/api")
+    L = [f"{method} {path} HTTP/1.1", f"Host: {host}"]
+    if is_chrome:
+        ver = ua.split("Chrome/")[1].split(".")[0]
+        L.append(f'sec-ch-ua: "Chromium";v="{ver}", "Not:A-Brand";v="24", '
+                 f'"Google Chrome";v="{ver}"')
+        L.append(f"sec-ch-ua-mobile: ?{1 if is_mobile else 0}")
+        L.append(f'sec-ch-ua-platform: "{"Android" if is_mobile else "Windows"}"')
+    if is_doc and is_chrome:
+        L.append("Upgrade-Insecure-Requests: 1")
+    L.append(f"User-Agent: {ua}")
+    L.append(f"Accept: {_accept_for(path)}")
+    if is_chrome:
+        site = "same-origin" if referer and host in referer else "none" if is_doc else "same-origin"
+        L.append(f"Sec-Fetch-Site: {site}")
+        L.append(f"Sec-Fetch-Mode: {'navigate' if is_doc else 'no-cors'}")
+        L.append(f"Sec-Fetch-Dest: {'document' if is_doc else 'empty'}")
+        if is_doc:
+            L.append("Sec-Fetch-User: ?1")
+    L.append("Accept-Encoding: gzip, deflate, br")
+    L.append("Accept-Language: en-US,en;q=0.9")
+    if referer:
+        L.append(f"Referer: {referer}")
+    if cookie:
+        L.append(f"Cookie: {cookie}")
+    if method in ("POST", "PUT"):
+        L.append("Content-Type: application/json")
+        L.append(f"Content-Length: {len(body)}")
+    L.append("Connection: keep-alive")
+    return ("\r\n".join(L) + "\r\n\r\n").encode() + body
+
+
+_DATES = ["Mon, 24 Jun 2024 10:15:32 GMT", "Tue, 25 Jun 2024 14:02:11 GMT",
+          "Wed, 26 Jun 2024 09:48:57 GMT", "Thu, 27 Jun 2024 18:21:40 GMT"]
+_COMPRESSIBLE = {"text/html", "text/css", "application/javascript",
+                 "application/json", "text/plain", "application/xml"}
+
+
+def _http_response(rng, host, path="/", status=200, ctype=None, body=None,
+                   set_cookie=True, location=None, gzip_ok=True) -> bytes:
     sid = "%016x" % rng.getrandbits(64)
-    body = _HTML_BODY.format(title=host.split(".")[0].capitalize(), sid=sid)
-    hdr = (f"HTTP/1.1 200 OK\r\nServer: {rng.choice(_SERVER_BANNERS)}\r\n"
-           f"Date: Mon, 24 Jun 2024 10:15:32 GMT\r\nContent-Type: text/html; charset=UTF-8\r\n"
-           f"Content-Length: {len(body)}\r\nConnection: keep-alive\r\n"
-           f"Set-Cookie: sid={sid}; HttpOnly; Path=/\r\n\r\n")
-    return (hdr + body).encode()
+    etag = '"%x-%x"' % (rng.getrandbits(28), rng.getrandbits(36))
+    if body is None:
+        title = host.split(".")[0].capitalize()
+        body = _HTML_BODY.format(title=title, sid=sid)
+    if isinstance(body, str):
+        body = body.encode()
+    ctype = ctype or "text/html; charset=UTF-8"
+    reason = {200: "OK", 301: "Moved Permanently", 302: "Found",
+              304: "Not Modified", 404: "Not Found"}.get(status, "OK")
+    L = [f"HTTP/1.1 {status} {reason}",
+         f"Date: {rng.choice(_DATES)}",
+         f"Server: {rng.choice(_SERVER_BANNERS)}"]
+    pb = rng.choice(_POWERED_BY)
+    if pb:
+        L.append(f"X-Powered-By: {pb}")
+    if location:
+        L.append(f"Location: {location}")
+    if status == 304:
+        L.append(f"ETag: {etag}")
+        L.append("Cache-Control: max-age=3600")
+        return ("\r\n".join(L) + "\r\n\r\n").encode()
+    L.append(f"Content-Type: {ctype}")
+    # gzip compressible text responses, the way real servers do (Wireshark
+    # shows the body as compressed bytes and decompresses it in the HTTP view).
+    base_ct = ctype.split(";")[0].strip()
+    if (gzip_ok and base_ct in _COMPRESSIBLE and len(body) > 24
+            and rng.random() < 0.7):
+        body = gzip.compress(body, compresslevel=6)
+        L.append("Content-Encoding: gzip")
+    L.append(f"Content-Length: {len(body)}")
+    L.append(f"ETag: {etag}")
+    L.append(f"Last-Modified: {rng.choice(_DATES)}")
+    L.append("Cache-Control: " + rng.choice(
+        ["no-cache, no-store, must-revalidate", "max-age=3600, public",
+         "private, max-age=0", "max-age=31536000, immutable"]))
+    L.append("Vary: Accept-Encoding")
+    L.append("X-Content-Type-Options: nosniff")
+    if rng.random() < 0.5:
+        L.append("X-Frame-Options: SAMEORIGIN")
+    if rng.random() < 0.3:
+        L.append("Strict-Transport-Security: max-age=31536000")
+    if set_cookie and path in ("/", "/login", "/index.html", "/dashboard"):
+        L.append(f"Set-Cookie: sid={sid}; HttpOnly; Secure; SameSite=Lax; Path=/")
+    L.append("Connection: keep-alive")
+    return ("\r\n".join(L) + "\r\n\r\n").encode() + body
+
+
+def _asset_response(rng, path):
+    """Return (content_type, body_bytes) appropriate to an asset path."""
+    if path.endswith(".css"):
+        return "text/css", _CSS_BODY.encode()
+    if path.endswith(".js"):
+        return "application/javascript", _JS_BODY.encode()
+    if path.endswith(".ico") or path.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+        head = b"\x89PNG\r\n\x1a\n" if not path.endswith(".ico") else b"\x00\x00\x01\x00"
+        return ("image/png" if not path.endswith(".ico") else "image/x-icon",
+                head + bytes(rng.getrandbits(8) for _ in range(rng.randint(200, 1200))))
+    if path.endswith(".woff2"):
+        return "font/woff2", b"wOF2" + bytes(rng.getrandbits(8) for _ in range(rng.randint(300, 900)))
+    if path.startswith("/api"):
+        import json as _json
+        data = _json.dumps({"user": "host-%02d" % rng.randint(1, 20),
+                            "role": rng.choice(["admin", "user", "auditor"]),
+                            "ts": 1700000000 + rng.randint(0, 99999)})
+        return "application/json", data.encode()
+    return "text/html; charset=UTF-8", b"<html><body>ok</body></html>"
 
 
 # --- conversation engine ---------------------------------------------------
@@ -585,13 +742,39 @@ def tcp_session(net: Network, client: Host, server: Host, dport: int,
 
 
 def conv_http(net, rng, clock, cfg):
+    """A realistic page load: the HTML document followed by several asset requests
+    (CSS/JS/images/favicon/API) over one keep-alive connection - so Follow Stream
+    shows a full browsing exchange rather than a lone GET."""
     client = rng.choice(net.clients)
     host = rng.choice([h for h in net.servers if not h.endswith(".local")] or list(net.servers))
     server = net.servers[host]
-    req = _http_request(host, rng.choice(_PATHS), rng.choice(_USER_AGENTS))
-    resp = _http_response(rng, host)
-    return tcp_session(net, client, server, 80,
-                       [("c2s", req), ("s2c", resp)], rng, clock, cfg)
+    ua = rng.choice(_USER_AGENTS)
+    page = rng.choice(_PATHS)
+    referer = rng.choice(_REFERERS)
+    page_url = f"http://{host}{page}"
+    cookie = None
+
+    exchanges = []
+    # 1) the document
+    exchanges.append(("c2s", _http_request(rng, host, page, ua, referer=referer)))
+    exchanges.append(("s2c", _http_response(rng, host, path=page)))
+    # a session cookie now exists for subsequent asset requests
+    cookie = "sid=%016x" % rng.getrandbits(64)
+
+    # 2) a handful of assets on the same connection (only for browser UAs)
+    is_browser = "Mozilla" in ua
+    if is_browser:
+        for asset in rng.sample(_ASSETS, rng.randint(2, 5)):
+            exchanges.append(("c2s", _http_request(rng, host, asset, ua,
+                                                   referer=page_url, cookie=cookie)))
+            # occasionally the asset is cached -> 304 Not Modified
+            if rng.random() < 0.25:
+                exchanges.append(("s2c", _http_response(rng, host, path=asset, status=304)))
+            else:
+                ct, body = _asset_response(rng, asset)
+                exchanges.append(("s2c", _http_response(rng, host, path=asset,
+                                                        ctype=ct, body=body, set_cookie=False)))
+    return tcp_session(net, client, server, 80, exchanges, rng, clock, cfg)
 
 
 def conv_https(net, rng, clock, cfg):
@@ -720,17 +903,24 @@ _CONV_DISPATCH = {
 
 
 def make_noise(proto: str, count: int, cfg: NoiseConfig, rng: random.Random,
-               clock: list[float], net: Network) -> list:
+               clock: list[float], net: Network, progress=None) -> list:
     """Generate `count` realistic *sessions* of `proto`. Each session expands
-    into several packets (handshake, data, acks, teardown)."""
+    into several packets (handshake, data, acks, teardown). If `progress` is
+    given it is called with the number of sessions completed, periodically."""
     # 'udp' maps onto DNS-style request/response service chatter
     fn = _CONV_DISPATCH.get("dns" if proto == "udp" else proto)
     if fn is None:
         raise ValueError(f"unknown protocol: {proto}")
     pkts = []
+    done = 0
     for _ in range(count):
         clock[0] += abs(rng.gauss(cfg.jitter, cfg.jitter / 2))  # idle gap between sessions
         pkts += fn(net, rng, clock, cfg)
+        done += 1
+        if progress and done % 250 == 0:
+            progress(250)
+    if progress and done % 250:
+        progress(done % 250)
     return pkts
 
 
@@ -849,20 +1039,59 @@ def hide_http_stream(flag: bytes, cfg: NoiseConfig, rng: random.Random,
     return res
 
 
+# SpongeBob-flavored fake-flag fodder (on-theme for the Chum Bucket).
+_SB_CHARS = ["spongebob", "patrick", "squidward", "mrkrabs", "plankton", "sandy",
+             "gary", "karen", "mrspuff", "squilliam", "larry", "pearl",
+             "bubblebass", "flyingdutchman", "mermaidman", "barnacleboy",
+             "oldmanjenkins", "bubblebuddy", "kingneptune", "puffyfluffy"]
+_SB_WORDS = ["krabbypatty", "bikinibottom", "chumbucket", "krustykrab", "jellyfish",
+             "secretformula", "spatula", "pineapple", "goofygoober", "tartarsauce",
+             "barnacles", "fishpaste", "kelpshake", "anchorarms", "mocchocolate",
+             "imready", "f1shh00ks", "musclebob", "buffpants", "rippedtrousers"]
+_LEET = {"a": "4", "e": "3", "i": "1", "o": "0", "s": "5", "t": "7"}
+
+
+def _leetify(s: str, rng: random.Random) -> str:
+    return "".join(_LEET.get(c, c) if rng.random() < 0.35 else c for c in s)
+
+
+def random_decoy_text(rng: random.Random) -> str:
+    """A random SpongeBob-themed fake-flag inner string. Never repeats a pattern
+    predictably, so red herrings look varied."""
+    pat = rng.randint(0, 5)
+    if pat == 0:
+        s = f"{rng.choice(_SB_CHARS)}_{rng.choice(_SB_WORDS)}"
+    elif pat == 1:
+        s = f"{rng.choice(_SB_WORDS)}_{rng.randint(10, 9999)}"
+    elif pat == 2:
+        s = f"{rng.choice(_SB_CHARS)}{rng.choice(_SB_CHARS)}".replace("_", "")
+    elif pat == 3:
+        s = f"{rng.choice(_SB_CHARS)}_loves_{rng.choice(_SB_WORDS)}"
+    elif pat == 4:
+        s = f"{rng.choice(_SB_WORDS)}_{rng.choice(_SB_CHARS)}_{rng.randint(1, 99)}"
+    else:
+        s = f"not_{rng.choice(_SB_CHARS)}s_{rng.choice(_SB_WORDS)}"
+    return _leetify(s, rng)
+
+
 def make_decoys(wrapper: str, count: int, cfg: NoiseConfig, rng: random.Random,
                 clock: list[float], net: Network) -> list:
     """Plant plausible-but-wrong flag-shaped strings as red herrings, carried in
-    real-looking HTTP traffic between actual hosts."""
+    real-looking HTTP traffic between actual hosts. Each decoy is a unique,
+    randomized SpongeBob-themed string."""
     open_, close = wrapper_parts(wrapper)
-    fakes = ["n0t_th3_fl4g", "almost_but_no", "red_herring_42", "keep_looking",
-             "def_not_it", "try_again_lol"]
+    notes = ["# debug note: ", "# TODO remove before prod: ", "# old test flag: ",
+             "<!-- staging flag ", "# leftover from CTF practice: ", "# nope: "]
     pkts = []
     for _ in range(count):
         client = rng.choice(net.clients)
         server = rng.choice(list(net.servers.values()))
+        fake = f"{open_}{random_decoy_text(rng)}{close}"
+        note = rng.choice(notes)
+        tail = " -->" if note.startswith("<!--") else ""
         body = (f"HTTP/1.1 200 OK\r\nServer: {rng.choice(_SERVER_BANNERS)}\r\n"
-                f"Content-Type: text/plain\r\n\r\n"
-                f"# debug note: {open_}{rng.choice(fakes)}{close}\n").encode()
+                f"Content-Type: text/plain\r\nContent-Length: {len(note)+len(fake)+len(tail)+1}\r\n\r\n"
+                f"{note}{fake}{tail}\n").encode()
         p = (_eth(net, server.ip, client.ip) /
              IP(src=server.ip, dst=client.ip) /
              TCP(sport=80, dport=rng.randint(1025, 65535), flags="PA",
@@ -1136,8 +1365,14 @@ def scenario_http_basic(flag: bytes, rng, clock, cfg, scheme, xor_key,
     req = (f"GET /admin/ HTTP/1.1\r\nHost: {host}\r\n"
            f"Authorization: Basic {token}\r\n"
            f"User-Agent: {rng.choice(_USER_AGENTS)}\r\nAccept: */*\r\n\r\n").encode()
-    resp = (b"HTTP/1.1 200 OK\r\nServer: nginx/1.24.0\r\n"
-            b"Content-Type: text/html\r\nContent-Length: 13\r\n\r\n<h1>Admin</h1>")
+    admin_body = ("<!DOCTYPE html><html><head><title>Admin Console</title></head>"
+                  "<body><h1>Admin Console</h1><p>Logged in as <b>" + user + "</b>.</p>"
+                  "<table><tr><th>User</th><th>Role</th><th>Last seen</th></tr>"
+                  "<tr><td>jdoe</td><td>auditor</td><td>2024-06-24</td></tr>"
+                  "<tr><td>svc_sql</td><td>service</td><td>2024-06-25</td></tr></table>"
+                  "</body></html>").encode()
+    resp = _http_response(rng, host, path="/admin/", ctype="text/html; charset=UTF-8",
+                          body=admin_body)
     pkts = tcp_session(net, client, server, 80, [("c2s", req), ("s2c", resp)], rng, clock, cfg)
     res = HideResult(packets=pkts)
     for p in pkts:
@@ -1203,15 +1438,27 @@ def scenario_c2_beacon(flag: bytes, rng, clock, cfg, scheme, xor_key,
     uri = "/api/v1/telemetry"
     res = HideResult()
     start = clock[0]
+    beacon_ua = rng.choice([
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; WOW64; Trident/7.0; rv:11.0) like Gecko",
+    ])
     for i in range(n_beacons):
         body = (f"id=7f3a&seq={i}&data=" +
                 (enc if i == flag_beacon else base64.b64encode(
                     bytes(rng.getrandbits(8) for _ in range(12))).decode())).encode()
         req = (f"POST {uri} HTTP/1.1\r\nHost: {c2.name}\r\n"
-               f"User-Agent: Mozilla/5.0 (Windows NT 10.0)\r\n"
+               f"User-Agent: {beacon_ua}\r\n"
+               f"Accept: */*\r\nAccept-Encoding: gzip, deflate\r\n"
                f"Content-Type: application/x-www-form-urlencoded\r\n"
-               f"Content-Length: {len(body)}\r\n\r\n").encode() + body
-        resp = b"HTTP/1.1 200 OK\r\nServer: nginx\r\nContent-Length: 2\r\n\r\nok"
+               f"Content-Length: {len(body)}\r\nConnection: keep-alive\r\n\r\n").encode() + body
+        # realistic-looking C2 tasking reply: full headers + an encoded 'task' blob
+        task = base64.b64encode(bytes(rng.getrandbits(8)
+                                      for _ in range(rng.randint(16, 64)))).decode()
+        rbody = ('{"status":"ok","interval":%d,"jitter":%d,"task":"%s"}'
+                 % (int(interval), rng.randint(5, 20), task)).encode()
+        resp = _http_response(rng, c2.name, path=uri, ctype="application/json",
+                              body=rbody, set_cookie=False)
         # place each beacon at a fixed interval
         clock[0] = start + i * interval
         session = tcp_session(net, client, c2, 80, [("c2s", req), ("s2c", resp)],
@@ -1251,7 +1498,7 @@ _SCENARIOS = {
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def build_challenge(args) -> tuple[list, list[str], "Network"]:
+def build_challenge(args, progress=None) -> tuple[list, list[str], "Network"]:
     rng = random.Random(args.seed)
     cfg = NoiseConfig(subnet=args.subnet, seed=args.seed, jitter=args.jitter,
                       normalize=args.normalize, n_clients=args.clients)
@@ -1269,7 +1516,7 @@ def build_challenge(args) -> tuple[list, list[str], "Network"]:
                      ("tcp", args.tcp), ("udp", args.udp), ("dns", args.dns),
                      ("icmp", args.icmp), ("http", args.http), ("https", args.https)):
         if n > 0:
-            all_pkts += make_noise(proto, n, cfg, rng, clock, net)
+            all_pkts += make_noise(proto, n, cfg, rng, clock, net, progress=progress)
 
     # decoys
     if args.decoys > 0:
@@ -1550,6 +1797,10 @@ def main():
                     help="output pcap name; .pcap is added automatically")
     ap.add_argument("--answer-key", default="",
                     help="answer-key name; defaults to <out>_answer.txt")
+    ap.add_argument("--outdir", default="ChumOutput",
+                    help="parent folder for generated challenges (default: ChumOutput)")
+    ap.add_argument("--no-subfolder", action="store_true",
+                    help="write files to the current directory instead of ChumOutput/<name>/")
     ap.add_argument("--no-check", action="store_true",
                     help="skip the post-generation solvability self-check")
     ap.add_argument("--quiet", action="store_true")
@@ -1563,32 +1814,90 @@ def main():
     if not args.quiet:
         print_banner()
 
-    if go_interactive:
-        args = interactive_config(args)
+    if not go_interactive:
+        generate_once(args)
+        return
+
+    # Interactive: keep offering new challenges until the user exits.
+    import copy
+    base = args
+    while True:
+        run_args = copy.copy(base)
+        run_args = interactive_config(run_args)
+        generate_once(run_args)
+        if not ask_yesno("\nGenerate another challenge?", True):
+            say("\nThanks for chumming the water. See you next tide. \U0001F41F",
+                "subtitle")
+            break
+
+
+def generate_once(args):
+    """Run a single generation: resolve paths, build, write, self-check, report,
+    and print how long it took. Shows a progress bar / heads-up for big captures."""
+    import os, time
+    t0 = time.perf_counter()
 
     # force standard extensions; user only supplies a name
     args.out = force_ext(args.out, ".pcap")
     if not args.answer_key:
-        import os
         args.answer_key = os.path.splitext(args.out)[0] + "_answer.txt"
     else:
         args.answer_key = force_ext(args.answer_key, ".txt")
 
-    pkts, solution, net, located = build_challenge(args)
-    wrpcap(args.out, pkts)
-    write_answer_key(args.answer_key, args, solution, len(pkts), located)
+    # organize everything under ChumOutput/<challenge-name>/ unless the user
+    # already gave an explicit path with directories in it
+    base = os.path.splitext(os.path.basename(args.out))[0]
+    if not args.no_subfolder and os.path.dirname(args.out) in ("", "."):
+        out_dir = os.path.join(args.outdir, base)
+        os.makedirs(out_dir, exist_ok=True)
+        args.out = os.path.join(out_dir, os.path.basename(args.out))
+        args.answer_key = os.path.join(out_dir, os.path.basename(args.answer_key))
 
-    ok = None
-    if not args.no_check:
-        ok = self_check(pkts, args)
+    # estimate workload and warn for big captures. Packets-per-session differ a
+    # lot by protocol (an HTTP page load is ~20+ packets; an ARP exchange is 2).
+    _PER = {"arp": 2, "dhcp": 4, "dns": 2, "udp": 2, "icmp": 6,
+            "tcp": 10, "https": 13, "http": 22}
+    total_sessions = sum(getattr(args, k) for k in
+                         ("arp", "dhcp", "tcp", "udp", "dns", "icmp", "http", "https"))
+    est_packets = sum(getattr(args, k) * w for k, w in _PER.items()) + args.decoys + 40
+    if not args.quiet and est_packets > 75000:
+        eta = est_packets / 1500.0   # ~packets/sec on a typical machine
+        mins = f"~{eta/60:.1f} min" if eta > 90 else f"~{eta:.0f}s"
+        say(f"[!] Heads-up: ~{est_packets:,} packets projected ({mins} to build). "
+            f"Large captures are slow to build and write - this is normal, hang tight.",
+            "warning")
+
+    # build (with progress bar when rich is available and we're not quiet)
+    if _HAS_RICH and not args.quiet and total_sessions > 0:
+        from rich.progress import (Progress, SpinnerColumn, BarColumn, TextColumn,
+                                   TimeElapsedColumn, MofNCompleteColumn)
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                      BarColumn(), MofNCompleteColumn(), TimeElapsedColumn(),
+                      console=_console, transient=True) as prog:
+            task = prog.add_task("Chumming the water", total=total_sessions)
+            pkts, solution, net, located = build_challenge(
+                args, progress=lambda n: prog.advance(task, n))
+            prog.update(task, description="Writing pcap", completed=total_sessions)
+            wrpcap(args.out, pkts)
+            prog.update(task, description="Verifying")
+            ok = None if args.no_check else self_check(pkts, args)
+        write_answer_key(args.answer_key, args, solution, len(pkts), located)
+    else:
+        pkts, solution, net, located = build_challenge(args)
+        wrpcap(args.out, pkts)
+        write_answer_key(args.answer_key, args, solution, len(pkts), located)
+        ok = None if args.no_check else self_check(pkts, args)
+
+    elapsed = time.perf_counter() - t0
 
     if not args.quiet:
         _eff, _note = effective_encoding(args)
         if _note:
             say(f"[!] Encoding note: {_note}", "warning")
-        say(f"[+] Wrote {len(pkts)} packets to {args.out}", "success")
+        say(f"[+] Wrote {len(pkts):,} packets to {args.out}", "success")
         say(f"[+] Answer key -> {args.answer_key}", "success")
-        say(f"[+] Hosts on LAN: {len(net.clients)} clients + gateway + resolver", "meta")
+        say(f"[+] Hosts on LAN: {len(net.clients)} clients + gateway + resolver "
+            f"+ {len(net.servers)} servers", "meta")
         say(f"[+] Flag: {format_flag(args.wrapper, args.flag)}", "highlight")
         if ok is True:
             say("[+] Self-check: flag is recoverable from the capture. OK", "success")
@@ -1600,6 +1909,8 @@ def main():
         say("[+] Solve path:", "menu_title")
         for i, s in enumerate(solution, 1):
             say(f"      {i}. {s}", "menu_item")
+        say(f"[+] Completed in {elapsed:.2f}s "
+            f"({len(pkts)/max(elapsed,0.001):,.0f} packets/s)", "success")
 
 
 if __name__ == "__main__":
