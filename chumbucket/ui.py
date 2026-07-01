@@ -9,7 +9,7 @@ TOOL_NAME   = "ChumBucket"
 SUBTITLE    = "Network-Forensics CTF Challenge Forge"
 
 
-VERSION     = "v1.2-beta"
+VERSION     = "v1.5"
 
 
 AUTHOR      = "Profe Malware"
