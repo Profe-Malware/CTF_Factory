@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Generated output
+ChumOutput/
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store
