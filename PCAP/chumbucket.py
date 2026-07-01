@@ -31,7 +31,7 @@ from scapy.all import (
 
 TOOL_NAME   = "ChumBucket"
 SUBTITLE    = "Network-Forensics CTF Challenge Forge"
-VERSION     = "v1.0-beta"
+VERSION     = "v1.2-beta"
 AUTHOR      = "Profe Malware"
 DESCRIPTION = (
     "Chums the water with realistic background traffic and decoy flags, then hides\n"
@@ -1746,7 +1746,8 @@ def scenario_malware_chain(flag, rng, clock, cfg, scheme, xor_key, net):
            else encode_payload(flag, scheme, xor_key).decode())
     client = rng.choice(net.clients)
     servers = list(net.servers.values())
-    lure, hop, drop = (rng.choice(servers) for _ in range(3))
+    lure, hop, drop = (rng.sample(servers, 3) if len(servers) >= 3
+                       else [rng.choice(servers) for _ in range(3)])
     ua = rng.choice(_USER_AGENTS)
     res = HideResult()
 
@@ -1981,6 +1982,76 @@ def build_challenge(args, progress=None) -> tuple[list, list[str], "Network"]:
 
     return all_pkts, hr.solution, net, located
 
+# Player-facing incident briefings: the "why you're looking" context that turns a
+# raw pcap into a challenge. Keyed by challenge name (scenario or hide-method).
+# Deliberately NON-spoiler - they set the scene without naming the exact carrier.
+# TO ADD ONE: add "<name>": "<briefing text>" for any new scenario/method.
+_BRIEFINGS = {
+    # hide methods
+    "dns": "A workstation on the network is suspected of quietly tunneling data "
+           "out over DNS. Pull the capture from that host and recover what was "
+           "smuggled out - the exfiltrated data encodes the flag.",
+    "split-tcp": "An analyst flagged some odd traffic where one message looked "
+                 "deliberately broken into pieces across several packets. "
+                 "Reassemble the pieces in the right order to recover the flag.",
+    "split-icmp": "Ping traffic on this segment looks heavier than it should. "
+                  "Someone hid a message inside the echo payloads; collect and "
+                  "reassemble it to recover the flag.",
+    "http": "A user's web session is under review after a DLP alert. Something "
+            "was tucked into the HTTP traffic - follow the stream to recover the flag.",
+    # scenarios
+    "kerberoast": "Your SIEM fired on suspicious Kerberos activity against the "
+                  "domain controller. Investigate the capture, identify what the "
+                  "attacker was harvesting, and recover the flag from the anomaly.",
+    "ftp-creds": "A legacy FTP server is still running plaintext auth and security "
+                 "wants it gone. Prove the risk: find the credentials on the wire - "
+                 "the password is the flag.",
+    "telnet-creds": "An old device is still reachable over Telnet. Show why that's "
+                    "dangerous by recovering the login sent in the clear - the "
+                    "password is the flag.",
+    "http-basic": "An internal admin panel uses HTTP Basic auth over cleartext. "
+                  "Recover the credentials from the capture - the password is the flag.",
+    "arp-spoof": "Users report intermittent connectivity and possible interception. "
+                 "You suspect a man-in-the-middle on the LAN. Find the attack in the "
+                 "capture and recover the flag hidden in the malicious frames.",
+    "port-scan": "An IDS alert suggests one host was scanning another. Confirm the "
+                 "scan, find the service that actually answered, and recover the flag "
+                 "from what it returned.",
+    "brute-force": "Authentication logs show a spike of failed logins against a "
+                   "service. Find where the attacker finally succeeded - the "
+                   "cracked password is the flag.",
+    "c2-beacon": "A host is suspected of being infected and calling home. Find the "
+                 "regular command-and-control callbacks in the capture and recover "
+                 "the flag carried in one of the beacons.",
+    "rogue-dhcp": "Clients are getting a suspicious default gateway. You suspect a "
+                  "rogue DHCP server on the LAN. Find it in the capture and recover "
+                  "the flag it planted.",
+    "ssdp-upnp": "Odd UPnP/SSDP discovery traffic appeared on the network. Investigate "
+                 "the device announcements and recover the flag hidden in a malicious "
+                 "advertisement.",
+    "doh-beacon": "A host is beaconing to an encrypted-DNS resolver at suspiciously "
+                  "regular intervals. The payloads are encrypted, but not everything "
+                  "is - inspect the traffic and recover the flag.",
+    "dga-beacon": "Threat intel flagged malware that finds its C2 via generated "
+                  "domains. Spot the domain-generation activity in the capture and "
+                  "recover the flag hidden among the lookups.",
+    "malware-chain": "A user clicked a link and something downloaded. Trace the web "
+                     "activity from that host through to what was pulled down, and "
+                     "recover the flag left in the delivery chain.",
+    "ransomware-note": "A machine was hit by ransomware. Triage the capture, find "
+                       "the attacker's message to the victim, and recover the flag "
+                       "embedded in it.",
+    "pastebin-exfil": "DLP suspects data was posted to an external paste service. "
+                      "Find the uploads in the capture, piece the data back together, "
+                      "and recover the flag.",
+}
+_BRIEFING_FALLBACK = ("You've been handed a network capture and told a flag is "
+                      "hidden inside it. Investigate the traffic, identify what "
+                      "doesn't belong, and recover the flag.")
+
+
+def challenge_briefing(args) -> str:
+    return _BRIEFINGS.get(challenge_name(args), _BRIEFING_FALLBACK)
 
 def write_answer_key(path: str, args, solution: list[str], n_pkts: int,
                      located: list | None = None):
@@ -1999,8 +2070,13 @@ def write_answer_key(path: str, args, solution: list[str], n_pkts: int,
         f"Seed:           {args.seed}",
         f"Total packets:  {n_pkts}",
         "",
-        "INTENDED SOLVE PATH:",
+        "PLAYER BRIEFING (safe to share - sets the scene, no spoilers):",
     ]
+    import textwrap
+    for line in textwrap.wrap(challenge_briefing(args), 72):
+        lines.append("  " + line)
+    lines += ["", "=" * 48, "SPOILERS BELOW", "=" * 48, "",
+              "INTENDED SOLVE PATH:"]
     lines += [f"  {i}. {step}" for i, step in enumerate(solution, 1)]
     lines += ["", "CYBERCHEF RECIPE (gchq.github.io/CyberChef) - drag these in order:"]
     lines += [f"  {i}. {step}" for i, step in enumerate(cyberchef_recipe(args), 1)]
